@@ -44,9 +44,12 @@ COVERAGE_STATE_FILE = Path("coverage") / "coverage_state.pkl"
 class MimuleCoverageManager:
     """Holds the global coverage state dict.
 
-    Stubbed: exposes only the `state` attribute that CorpusScheduler reads.
-    Full implementation will add integer-ID allocation, log parsing, and
-    state serialization helpers when we wire mimule to Henry's event stream.
+    Stubbed: exposes the `state` attribute that downstream modules read
+    (CorpusScheduler, ScoringManager) plus the reverse_*_map properties
+    that ScoringManager uses for human-readable coverage-item names in
+    its [NEW GLOBAL EDGE] / [NEW RELATIVE EDGE] log lines. Full
+    implementation (integer-ID allocation, log parsing, state
+    serialization) lands when we wire mimule to Henry's event stream.
     """
 
     def __init__(self, state: dict[str, Any] | None = None):
@@ -61,6 +64,65 @@ class MimuleCoverageManager:
             "edge_map": {},
             "rare_event_map": {},
         }
+
+    @property
+    def reverse_uop_map(self) -> dict[int, str]:
+        """Map integer uop IDs back to their string names."""
+        return {v: k for k, v in self.state.get("uop_map", {}).items()}
+
+    @property
+    def reverse_edge_map(self) -> dict[int, str]:
+        """Map integer edge IDs back to their string names."""
+        return {v: k for k, v in self.state.get("edge_map", {}).items()}
+
+    @property
+    def reverse_rare_event_map(self) -> dict[int, str]:
+        """Map integer rare-event IDs back to their string names."""
+        return {v: k for k, v in self.state.get("rare_event_map", {}).items()}
+
+
+def merge_coverage_into_global(
+    state: dict[str, Any], child_coverage: dict[str, Any]
+) -> None:
+    """Merge child coverage hit-counts into the global counters.
+
+    Language-agnostic: iterates the `uops` / `edges` / `rare_events`
+    Counter-shaped sub-dicts from each harness in `child_coverage` and
+    accumulates them into `state["global_coverage"]`. Integer IDs are
+    kept as-is; this does no ID allocation.
+    """
+    global_coverage = state.setdefault("global_coverage", {})
+    for harness_data in child_coverage.values():
+        for cov_type in ("uops", "edges", "rare_events"):
+            global_map = global_coverage.setdefault(cov_type, {})
+            for item_id, count in harness_data.get(cov_type, {}).items():
+                global_map[item_id] = global_map.get(item_id, 0) + count
+
+
+def parse_log_for_edge_coverage(
+    log_path: Path, coverage_manager: "MimuleCoverageManager"
+) -> dict[str, Any]:
+    """Parse a log file and return per-harness coverage.
+
+    STUB — lafleur's implementation is a ~100 LOC state machine over
+    CPython's verbose LLTRACE output. mimule's replacement will consume
+    Henry's JSON Lines event stream (see the JIT instrumentation proposal
+    we sent him). Until that lands, this returns an empty dict so the
+    rest of the scoring pipeline can run against in-memory test fixtures.
+
+    Expected return shape (when implemented):
+        {
+            harness_id: {
+                "uops": Counter[int],
+                "edges": Counter[int],
+                "rare_events": Counter[int],
+                "trace_length": int,
+                "side_exits": int,
+            },
+            ...
+        }
+    """
+    return {}
 
 
 def save_coverage_state(state: dict[str, Any]) -> None:

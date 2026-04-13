@@ -1,0 +1,749 @@
+"""Scoring and coverage analysis for the mimule fuzzer.
+
+This module provides the MimuleScoringManager class ("The Judge") which handles:
+- Analyzing coverage results from child executions
+- Parsing JIT statistics from log output
+- Scoring mutations to decide interestingness
+- Analyzing runs for new coverage and interestingness
+
+Port note: inherited from lafleur/scoring.py with the following adaptations:
+
+  1. parse_jit_stats is stubbed — lafleur parses `[DRIVER:STATS]` and
+     `[EKG] WATCHED:` lines from CPython's verbose driver output. mimule
+     will parse Henry's JSON Lines event stream once the instrumentation
+     lands (see the JIT proposal sent to Henry). Stub returns an empty
+     JitStats dict so the rest of the scoring pipeline still runs.
+
+  2. The `ast.parse()` Python syntax validation in _prepare_new_coverage_result
+     is replaced with a simple non-empty check. Monkey syntax validation
+     will come later — either via tree-sitter-monkey (when we finish reviving
+     the grammar) or via Henry's parser (if he ships the toString() upgrade
+     and we go with the subprocess bridge).
+
+  3. Classes renamed to MimuleInterestingnessScorer and MimuleScoringManager
+     per the Mimule* prefix convention.
+
+  4. Imports updated to mimule.X. Dependencies on coverage/health/artifacts
+     currently resolve to minimal stubs exposing only the interface this
+     module needs — the stubs grow as later modules in the port expand them.
+
+The InterestingnessScorer's weights and JIT-vitals fields are kept verbatim.
+The vitals fields (tachycardia, zombie, chain depth) are CPython-specific in
+name but reusable conceptually for Monkey — they'll be populated with
+Monkey-equivalent values when Henry's event stream tells us what's available.
+"""
+
+import copy
+import hashlib
+import sys
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
+
+from mimule.coverage import (
+    MimuleCoverageManager,
+    merge_coverage_into_global,
+    parse_log_for_edge_coverage,
+)
+from mimule.types import (
+    AnalysisResult,
+    CorpusFileMetadata,
+    CrashResult,
+    DivergenceResult,
+    JitStats,
+    MutationInfo,
+    NewCoverageResult,
+    NoChangeResult,
+    RunStats,
+)
+from mimule.utils import ExecutionResult
+
+if TYPE_CHECKING:
+    from mimule.artifacts import MimuleArtifactManager
+    from mimule.corpus_manager import MimuleCorpusManager
+    from mimule.health import MimuleHealthMonitor
+
+
+@dataclass(frozen=True)
+class ScoringContext:
+    """Bundles parameters for interestingness scoring decisions."""
+
+    parent_id: str | None
+    mutation_info: MutationInfo
+    parent_file_size: int
+    parent_lineage_edge_count: int
+    child_file_size: int
+    jit_avg_time_ms: float | None = None
+    nojit_avg_time_ms: float | None = None
+    nojit_cv: float | None = None
+    jit_stats: JitStats | None = None
+    parent_jit_stats: JitStats | None = None
+
+
+# Coverage types tracked by the fuzzer
+COVERAGE_TYPES = ("uops", "edges", "rare_events")
+
+# Tachycardia (instability) tracking constants
+TACHYCARDIA_DECAY_FACTOR = 0.95
+MAX_DENSITY_GROWTH_FACTOR = 5.0
+
+
+def _clamp_and_decay(
+    child_val: float,
+    parent_val: float,
+    growth_factor: float = MAX_DENSITY_GROWTH_FACTOR,
+    decay_factor: float = TACHYCARDIA_DECAY_FACTOR,
+) -> tuple[float, float]:
+    """Clamp a child metric relative to its parent, then apply decay.
+
+    Prevents a single massive spike from setting an unreachable bar for the
+    next generation, then applies exponential decay to gradually cool the value.
+
+    Returns (clamped_value, decayed_value).
+    """
+    if parent_val > 0:
+        clamped = min(parent_val * growth_factor, child_val)
+    else:
+        clamped = child_val
+    return clamped, clamped * decay_factor
+
+
+@dataclass
+class NewCoverageInfo:
+    """A data class to hold the counts of new coverage found."""
+
+    global_uops: int = 0
+    relative_uops: int = 0
+    global_edges: int = 0
+    relative_edges: int = 0
+    global_rare_events: int = 0
+    relative_rare_events: int = 0
+    total_child_edges: int = 0
+
+    def is_interesting(self) -> bool:
+        """Return True if any new coverage was found."""
+        return (
+            self.global_uops > 0
+            or self.relative_uops > 0
+            or self.global_edges > 0
+            or self.relative_edges > 0
+            or self.global_rare_events > 0
+            or self.relative_rare_events > 0
+        )
+
+
+class MimuleInterestingnessScorer:
+    """Calculates a score to determine if a mutated child is worth keeping."""
+
+    MIN_INTERESTING_SCORE = 10.0
+
+    # --- Coverage scoring weights ---
+    GLOBAL_EDGE_WEIGHT = 10.0
+    GLOBAL_UOP_WEIGHT = 5.0
+    GLOBAL_RARE_EVENT_WEIGHT = 10.0
+    RELATIVE_EDGE_WEIGHT = 1.0
+    RELATIVE_UOP_WEIGHT = 0.5
+
+    # --- Richness and density weights ---
+    RICHNESS_BONUS_WEIGHT = 5.0
+    RICHNESS_THRESHOLD = 0.1
+    DENSITY_PENALTY_WEIGHT = 2.0
+    DENSITY_PENALTY_THRESHOLD = 0.5
+
+    # --- Timing weights ---
+    TIMING_BONUS_MULTIPLIER = 50.0
+    TIMING_CV_MULTIPLIER = 3.0
+
+    # --- JIT Vitals bonuses (absolute density, fallback) ---
+    TACHYCARDIA_BONUS = 20.0
+    TACHYCARDIA_MIN_DENSITY = 10.0
+    TACHYCARDIA_PARENT_MULTIPLIER = 1.25
+
+    # --- JIT Vitals bonuses (delta density, session mode) ---
+    TACHYCARDIA_DELTA_DENSITY_THRESHOLD = 0.135
+    TACHYCARDIA_DELTA_EXITS_THRESHOLD = 20
+    TACHYCARDIA_DELTA_BONUS = 20.0
+
+    ZOMBIE_BONUS = 50.0
+    CHAIN_DEPTH_BONUS = 10.0
+    CHAIN_DEPTH_THRESHOLD = 3
+    STUB_BONUS = 5.0
+    STUB_SIZE_THRESHOLD = 5
+
+    def __init__(
+        self,
+        coverage_info: NewCoverageInfo,
+        parent_file_size: int,
+        parent_lineage_edge_count: int,
+        child_file_size: int,
+        is_timing_mode: bool,
+        jit_avg_time_ms: float | None,
+        nojit_avg_time_ms: float | None,
+        nojit_cv: float | None,
+        jit_stats: JitStats | None = None,
+        parent_jit_stats: JitStats | None = None,
+    ):
+        self.info = coverage_info
+        self.parent_file_size = parent_file_size
+        self.parent_lineage_edge_count = parent_lineage_edge_count
+        self.child_file_size = child_file_size
+        self.is_timing_mode = is_timing_mode
+        self.jit_avg_time_ms = jit_avg_time_ms
+        self.nojit_avg_time_ms = nojit_avg_time_ms
+        self.nojit_cv = nojit_cv
+        self.jit_stats = jit_stats or {}
+        self.parent_jit_stats = parent_jit_stats or {}
+
+    def calculate_score(self) -> float:
+        """Calculate a score based on new coverage, richness, density, and performance."""
+        score = self._score_timing() + self._score_jit_vitals() + self._score_coverage()
+        return score
+
+    def _score_timing(self) -> float:
+        """Score based on JIT-vs-non-JIT slowdown ratio."""
+        if not (self.is_timing_mode and self.jit_avg_time_ms and self.nojit_avg_time_ms):
+            return 0.0
+        if self.nojit_avg_time_ms <= 0:
+            return 0.0
+
+        slowdown_ratio = self.jit_avg_time_ms / self.nojit_avg_time_ms
+        nojit_cv = self.nojit_cv if self.nojit_cv is not None else 0.0
+        dynamic_threshold = 1.0 + (self.TIMING_CV_MULTIPLIER * nojit_cv)
+
+        print(
+            f"  [~] Timing slowdown ratio (JIT/non-JIT) is {slowdown_ratio:.3f} "
+            f"(minimum: {dynamic_threshold:.3f}).",
+            file=sys.stderr,
+        )
+
+        if slowdown_ratio > dynamic_threshold:
+            return (slowdown_ratio - 1.0) * self.TIMING_BONUS_MULTIPLIER
+        return 0.0
+
+    def _score_jit_vitals(self) -> float:
+        """Score based on JIT tachycardia, zombie traces, chain depth, and stubs."""
+        score = 0.0
+
+        zombie_traces = self.jit_stats.get("zombie_traces", 0)
+        max_chain_depth = self.jit_stats.get("max_chain_depth", 0)
+        min_code_size = self.jit_stats.get("min_code_size", 0)
+
+        # Tachycardia: prefer delta metrics (child-isolated) when available from
+        # session mode, fall back to absolute metrics for non-session runs.
+        # Delta fields may be None in old pickle data, so use `or` fallback.
+        child_delta_density = self.jit_stats.get("child_delta_max_exit_density") or 0.0
+        child_delta_exits = self.jit_stats.get("child_delta_total_exits") or 0
+
+        if child_delta_density > 0 or child_delta_exits > 0:
+            # Delta metrics available — child-isolated measurement.
+            parent_delta_density = self.parent_jit_stats.get("child_delta_max_exit_density") or 0.0
+            density_threshold = max(
+                self.TACHYCARDIA_DELTA_DENSITY_THRESHOLD,
+                parent_delta_density * self.TACHYCARDIA_PARENT_MULTIPLIER,
+            )
+            parent_delta_exits = self.parent_jit_stats.get("child_delta_total_exits") or 0
+            exits_threshold = max(
+                self.TACHYCARDIA_DELTA_EXITS_THRESHOLD,
+                parent_delta_exits * self.TACHYCARDIA_PARENT_MULTIPLIER,
+            )
+            if child_delta_density > density_threshold or child_delta_exits > exits_threshold:
+                print(
+                    f"  [+] JIT Tachycardia (delta): density={child_delta_density:.2f} "
+                    f"(threshold={density_threshold:.2f}), "
+                    f"exits={child_delta_exits} (threshold={exits_threshold:.0f})",
+                    file=sys.stderr,
+                )
+                score += self.TACHYCARDIA_DELTA_BONUS
+        else:
+            # No delta metrics — fall back to absolute (original behavior).
+            child_density = self.jit_stats.get("max_exit_density") or 0.0
+            parent_density = self.parent_jit_stats.get("max_exit_density") or 0.0
+            density_threshold = max(
+                self.TACHYCARDIA_MIN_DENSITY,
+                parent_density * self.TACHYCARDIA_PARENT_MULTIPLIER,
+            )
+            if child_density > density_threshold:
+                print(
+                    f"  [+] JIT Tachycardia (absolute): density={child_density:.2f} > "
+                    f"{density_threshold:.2f}",
+                    file=sys.stderr,
+                )
+                score += self.TACHYCARDIA_BONUS
+
+        if zombie_traces > 0:
+            print("  [!] JIT ZOMBIE STATE DETECTED!", file=sys.stderr)
+            score += self.ZOMBIE_BONUS
+
+        if max_chain_depth > self.CHAIN_DEPTH_THRESHOLD:
+            print("  [+] JIT Hyper-Extension (Deep Chains) detected.", file=sys.stderr)
+            score += self.CHAIN_DEPTH_BONUS
+
+        if 0 < min_code_size < self.STUB_SIZE_THRESHOLD:
+            score += self.STUB_BONUS
+
+        return score
+
+    def _score_coverage(self) -> float:
+        """Score based on new coverage discoveries, richness, and density."""
+        score = 0.0
+
+        # Heavily reward new global discoveries.
+        score += self.info.global_edges * self.GLOBAL_EDGE_WEIGHT
+        score += self.info.global_uops * self.GLOBAL_UOP_WEIGHT
+        score += self.info.global_rare_events * self.GLOBAL_RARE_EVENT_WEIGHT
+
+        # Smaller rewards for new relative discoveries.
+        score += self.info.relative_edges * self.RELATIVE_EDGE_WEIGHT
+        score += self.info.relative_uops * self.RELATIVE_UOP_WEIGHT
+
+        # Reward for richness (% increase in total coverage).
+        if self.parent_lineage_edge_count > 0:
+            percent_increase = (self.info.total_child_edges / self.parent_lineage_edge_count) - 1.0
+            if percent_increase > self.RICHNESS_THRESHOLD:
+                score += percent_increase * self.RICHNESS_BONUS_WEIGHT
+
+        # Penalize for low coverage density (large size increase for little gain).
+        if self.info.global_edges == 0 and self.info.relative_edges > 0:
+            size_increase_ratio = (self.child_file_size / (self.parent_file_size + 1)) - 1.0
+            if size_increase_ratio > self.DENSITY_PENALTY_THRESHOLD:
+                score -= size_increase_ratio * self.DENSITY_PENALTY_WEIGHT
+
+        return score
+
+
+class MimuleScoringManager:
+    """Manages scoring and coverage analysis for fuzzer results.
+
+    Handles analyzing coverage from child executions, parsing JIT
+    statistics, and deciding if mutations are interesting enough to keep.
+    """
+
+    def __init__(
+        self,
+        coverage_manager: MimuleCoverageManager,
+        timing_fuzz: bool = False,
+        artifact_manager: "MimuleArtifactManager | None" = None,
+        corpus_manager: "MimuleCorpusManager | None" = None,
+        get_core_code_func: Callable[[str], str] | None = None,
+        run_stats: RunStats | None = None,
+        health_monitor: "MimuleHealthMonitor | None" = None,
+    ):
+        """Initialize the MimuleScoringManager.
+
+        Args:
+            coverage_manager: MimuleCoverageManager for coverage state access.
+            timing_fuzz: Whether timing-based fuzzing mode is enabled. In
+                lafleur this enables the JIT-vs-non-JIT slowdown comparison;
+                mimule's equivalent (comparing Henry's engines — eval vs vm
+                vs jit vs wasm) will probably reuse this flag differently.
+            artifact_manager: MimuleArtifactManager for crash/divergence recording.
+            corpus_manager: MimuleCorpusManager for known_hashes lookup.
+            get_core_code_func: Function to extract core Monkey code from a
+                source file (strips the harness boilerplate).
+            run_stats: Run statistics dictionary for updating counters.
+            health_monitor: Optional MimuleHealthMonitor for adverse event tracking.
+        """
+        self.coverage_manager = coverage_manager
+        self.timing_fuzz = timing_fuzz
+        self.artifact_manager = artifact_manager
+        self.corpus_manager = corpus_manager
+        self._get_core_code = get_core_code_func
+        self.run_stats = run_stats
+        self.health_monitor = health_monitor
+
+    def find_new_coverage(
+        self,
+        child_coverage: dict[str, Any],
+        parent_lineage_profile: dict[str, Any],
+        parent_id: str | None,
+    ) -> NewCoverageInfo:
+        """Count all new global and relative coverage items from a child's run.
+
+        Args:
+            child_coverage: Coverage data from the child execution.
+            parent_lineage_profile: Coverage profile inherited from parent lineage.
+            parent_id: ID of the parent file (None for seed files).
+
+        Returns:
+            NewCoverageInfo object containing detailed coverage counts.
+        """
+        info = NewCoverageInfo()
+        total_edges = 0
+
+        # Pre-build reverse map and counter attribute lookups
+        reverse_maps = {
+            "uops": self.coverage_manager.reverse_uop_map,
+            "edges": self.coverage_manager.reverse_edge_map,
+            "rare_events": self.coverage_manager.reverse_rare_event_map,
+        }
+        counter_attrs = {
+            "uops": ("global_uops", "relative_uops"),
+            "edges": ("global_edges", "relative_edges"),
+            "rare_events": ("global_rare_events", "relative_rare_events"),
+        }
+
+        for harness_id, child_data in child_coverage.items():
+            lineage_harness_data = parent_lineage_profile.get(harness_id, {})
+
+            total_edges += len(child_data.get("edges", {}))
+
+            for cov_type in COVERAGE_TYPES:
+                lineage_set = lineage_harness_data.get(cov_type, set())
+                global_coverage_map = self.coverage_manager.state["global_coverage"].get(
+                    cov_type, {}
+                )
+                reverse_map = reverse_maps[cov_type]
+                global_attr, relative_attr = counter_attrs[cov_type]
+
+                for item_id in child_data.get(cov_type, {}):
+                    item_str = reverse_map.get(item_id, f"ID_{item_id}_(unknown)")
+
+                    if item_id not in global_coverage_map:
+                        setattr(info, global_attr, getattr(info, global_attr) + 1)
+                        print(
+                            f"[NEW GLOBAL {cov_type.upper()[:-1]}] '{item_str}' in harness '{harness_id}'",
+                            file=sys.stderr,
+                        )
+                    elif parent_id is not None and item_id not in lineage_set:
+                        setattr(info, relative_attr, getattr(info, relative_attr) + 1)
+                        print(
+                            f"[NEW RELATIVE {cov_type.upper()[:-1]}] '{item_str}' in harness '{harness_id}'",
+                            file=sys.stderr,
+                        )
+        info.total_child_edges = total_edges
+        return info
+
+    def parse_jit_stats(self, log_content: str) -> JitStats:
+        """Parse JIT stats from the driver log output.
+
+        STUB — lafleur parses `[DRIVER:STATS]` JSON lines and `[EKG] WATCHED:`
+        lines from CPython's verbose driver output. mimule's replacement will
+        consume Henry's JSON Lines event stream once the instrumentation lands
+        (see the JIT proposal sent to Henry). Until then, this returns an
+        empty JitStats dict so the rest of the scoring pipeline can run.
+
+        When implemented, the mimule version will likely aggregate events
+        like `trace_finalize` (→ max_trace_length, guard_count),
+        `guard_fail` (→ side_exits), `bailout` (→ rare events), and
+        `opt_pass` (→ optimization metrics) into the JitStats shape.
+        """
+        del log_content  # unused in stub
+        return {
+            "max_exit_count": 0,
+            "max_chain_depth": 0,
+            "zombie_traces": 0,
+            "min_code_size": 0,
+            "max_exit_density": 0.0,
+            "watched_dependencies": [],
+            "child_delta_max_exit_density": 0.0,
+            "child_delta_max_exit_count": 0,
+            "child_delta_total_exits": 0,
+            "child_delta_new_executors": 0,
+            "child_delta_new_zombies": 0,
+        }
+
+    def score_and_decide_interestingness(
+        self,
+        coverage_info: NewCoverageInfo,
+        ctx: ScoringContext,
+    ) -> bool:
+        """Use the scorer to decide if a child is interesting.
+
+        Args:
+            coverage_info: NewCoverageInfo with coverage counts.
+            ctx: ScoringContext bundling parent/child metadata and timing.
+
+        Returns:
+            True if the child is considered interesting.
+        """
+        if ctx.parent_id is None:
+            is_seed = "seed" in ctx.mutation_info.get("strategy", "")
+            if coverage_info.is_interesting() or is_seed:
+                return True
+            else:
+                print("  [~] Seed file produced no JIT coverage. Skipping.", file=sys.stderr)
+                return False
+
+        # For normal mutations, use the scoring logic.
+        scorer = MimuleInterestingnessScorer(
+            coverage_info,
+            ctx.parent_file_size,
+            ctx.parent_lineage_edge_count,
+            ctx.child_file_size,
+            self.timing_fuzz,
+            ctx.jit_avg_time_ms,
+            ctx.nojit_avg_time_ms,
+            ctx.nojit_cv,
+            ctx.jit_stats,
+            ctx.parent_jit_stats,
+        )
+        score = scorer.calculate_score()
+
+        if score >= scorer.MIN_INTERESTING_SCORE:
+            valid_timings = (
+                scorer.jit_avg_time_ms is not None
+                and scorer.nojit_avg_time_ms is not None
+                and scorer.nojit_avg_time_ms > 0
+            )
+            if self.timing_fuzz and valid_timings:
+                assert scorer.jit_avg_time_ms is not None
+                assert scorer.nojit_avg_time_ms is not None
+                slowdown_ratio = scorer.jit_avg_time_ms / scorer.nojit_avg_time_ms
+                print(
+                    f"  [+] Child is interesting with score: {score:.2f} (JIT slowdown: {slowdown_ratio:.2f}x)",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"  [+] Child is interesting with score: {score:.2f}", file=sys.stderr)
+            return True
+
+        print(f"  [+] Child IS NOT interesting with score: {score:.2f}", file=sys.stderr)
+        return False
+
+    def _update_global_coverage(self, child_coverage: dict[str, Any]) -> None:
+        """Commit the coverage from a new, interesting child to the global state."""
+        merge_coverage_into_global(self.coverage_manager.state, child_coverage)
+
+    def _calculate_coverage_hash(self, coverage_profile: dict[str, Any]) -> str:
+        """Create a deterministic SHA256 hash of a coverage profile's edges."""
+        all_edges = []
+        # We only hash the edges, as they provide the most significant signal.
+        # It's crucial to sort the items to ensure the hash is deterministic.
+        for harness_id in sorted(coverage_profile.keys()):
+            edges = sorted(coverage_profile[harness_id].get("edges", {}).keys())
+            if edges:
+                all_edges.append(f"{harness_id}:{','.join(str(edge) for edge in edges)}")
+
+        canonical_string = ";".join(all_edges)
+        return hashlib.sha256(canonical_string.encode("utf-8")).hexdigest()
+
+    def _build_lineage_profile(
+        self, parent_lineage_profile: dict[str, Any], child_baseline_profile: dict
+    ) -> dict:
+        """Create a new lineage profile by taking the union of a parent's
+        lineage and a child's own baseline coverage.
+        """
+        # Start with a deep copy of the parent's lineage to avoid side effects.
+        lineage = copy.deepcopy(parent_lineage_profile)
+        for harness_id, child_data in child_baseline_profile.items():
+            # Ensure the harness entry exists in the new lineage profile.
+            lineage_harness = lineage.setdefault(
+                harness_id,
+                {
+                    "uops": set(),
+                    "edges": set(),
+                    "rare_events": set(),
+                    "max_trace_length": 0,
+                    "max_side_exits": 0,
+                },
+            )
+            lineage_harness["uops"].update(child_data.get("uops", {}).keys())
+            lineage_harness["rare_events"].update(child_data.get("rare_events", {}).keys())
+            lineage_harness["edges"].update(child_data.get("edges", {}).keys())
+
+            lineage_harness["max_trace_length"] = max(
+                lineage_harness.get("max_trace_length", 0), child_data.get("trace_length", 0)
+            )
+            lineage_harness["max_side_exits"] = max(
+                lineage_harness.get("max_side_exits", 0), child_data.get("side_exits", 0)
+            )
+
+        return lineage
+
+    def analyze_run(
+        self,
+        exec_result: ExecutionResult,
+        parent_lineage_profile: dict[str, Any],
+        parent_id: str | None,
+        mutation_info: MutationInfo,
+        mutation_seed: int,
+        parent_file_size: int,
+        parent_lineage_edge_count: int,
+    ) -> AnalysisResult:
+        """Orchestrate the analysis of a run and return an AnalysisResult."""
+        if self.artifact_manager is None or self.corpus_manager is None:
+            raise RuntimeError("ScoringManager requires artifact_manager and corpus_manager")
+        if self._get_core_code is None:
+            raise RuntimeError("ScoringManager requires get_core_code_func")
+        if self.run_stats is None:
+            raise RuntimeError("ScoringManager requires run_stats")
+
+        if exec_result.is_divergence:
+            self.artifact_manager.save_divergence(
+                exec_result.source_path,
+                exec_result.jit_output or "",
+                exec_result.nojit_output or "",
+                exec_result.divergence_reason or "unknown",
+            )
+            self.run_stats["divergences_found"] = self.run_stats.get("divergences_found", 0) + 1
+            return DivergenceResult(status="DIVERGENCE", mutation_info=mutation_info or {})
+
+        log_content = ""
+        try:
+            log_content = exec_result.log_path.read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"  [!] Warning: Could not read log file for analysis: {e}", file=sys.stderr)
+
+        if self.artifact_manager.check_for_crash(
+            exec_result.returncode,
+            log_content,
+            exec_result.source_path,
+            exec_result.log_path,
+            exec_result.parent_path,
+            exec_result.session_files,
+            parent_id=parent_id,
+            mutation_info=mutation_info,
+            polluter_ids=exec_result.polluter_ids,
+        ):
+            return CrashResult(
+                status="CRASH",
+                mutation_info=mutation_info or {},
+                parent_id=parent_id,
+                fingerprint=self.artifact_manager.last_crash_fingerprint,
+            )
+
+        child_coverage = parse_log_for_edge_coverage(exec_result.log_path, self.coverage_manager)
+
+        coverage_info = self.find_new_coverage(child_coverage, parent_lineage_profile, parent_id)
+        jit_stats = self.parse_jit_stats(log_content)
+
+        # Retrieve parent JIT stats from metadata
+        parent_jit_stats: JitStats = {}
+        if parent_id:
+            parent_metadata: CorpusFileMetadata = self.coverage_manager.state[
+                "per_file_coverage"
+            ].get(parent_id, {})
+            parent_jit_stats = parent_metadata.get("discovery_mutation", {}).get("jit_stats", {})
+
+        scoring_ctx = ScoringContext(
+            parent_id=parent_id,
+            mutation_info=mutation_info,
+            parent_file_size=parent_file_size,
+            parent_lineage_edge_count=parent_lineage_edge_count,
+            child_file_size=exec_result.source_path.stat().st_size,
+            jit_avg_time_ms=exec_result.jit_avg_time_ms,
+            nojit_avg_time_ms=exec_result.nojit_avg_time_ms,
+            nojit_cv=exec_result.nojit_cv,
+            jit_stats=jit_stats,
+            parent_jit_stats=parent_jit_stats,
+        )
+        is_interesting = self.score_and_decide_interestingness(coverage_info, scoring_ctx)
+
+        if is_interesting:
+            return self._prepare_new_coverage_result(
+                exec_result,
+                child_coverage,
+                jit_stats,
+                parent_jit_stats,
+                parent_id,
+                mutation_info,
+                mutation_seed,
+            )
+
+        return NoChangeResult(status="NO_CHANGE")
+
+    def _prepare_new_coverage_result(
+        self,
+        exec_result: ExecutionResult,
+        child_coverage: dict[str, Any],
+        jit_stats: JitStats,
+        parent_jit_stats: JitStats,
+        parent_id: str | None,
+        mutation_info: MutationInfo,
+        mutation_seed: int,
+    ) -> AnalysisResult:
+        """Deduplicate, commit coverage, apply density decay, and build the result."""
+        assert self.corpus_manager is not None
+        assert self._get_core_code is not None
+
+        core_code_to_save = self._get_core_code(exec_result.source_path.read_text(encoding="utf-8"))
+
+        # Validate the extracted core code is non-empty. The lafleur equivalent
+        # runs ast.parse() here to catch broken boilerplate extractions that
+        # produce unparseable Python — those files poison the corpus because
+        # they can be selected but never mutated successfully. mimule's proper
+        # syntax validation (via tree-sitter-monkey or Henry's parser) comes
+        # later; for now, a non-empty check catches the worst case.
+        if not core_code_to_save.strip():
+            print(
+                "  [!] Warning: Extracted core code is empty. "
+                "Discarding to prevent corpus poisoning.",
+                file=sys.stderr,
+            )
+            if self.health_monitor:
+                self.health_monitor.record_core_code_syntax_error(
+                    parent_id,
+                    "empty core code after boilerplate extraction",
+                    strategy=mutation_info.get("strategy") if mutation_info else None,
+                )
+            return NoChangeResult(status="NO_CHANGE")
+
+        content_hash = hashlib.sha256(core_code_to_save.encode("utf-8")).hexdigest()
+        coverage_hash = self._calculate_coverage_hash(child_coverage)
+
+        if (content_hash, coverage_hash) in self.corpus_manager.known_hashes:
+            print(
+                f"  [~] New coverage found, but this is a known duplicate behavior "
+                f"(ContentHash: {content_hash[:10]}, CoverageHash: {coverage_hash[:10]}). Skipping.",
+                file=sys.stderr,
+            )
+            if self.health_monitor:
+                self.health_monitor.record_duplicate_rejected(content_hash, coverage_hash)
+            return NoChangeResult(status="NO_CHANGE")
+
+        # This is the crucial step: if it's new and not a duplicate, we commit the coverage.
+        self._update_global_coverage(child_coverage)
+
+        # --- Dynamic Density Clamping + Tachycardia Decay ---
+        # Clamp each metric relative to its parent (prevent unreachable spikes),
+        # then apply exponential decay to gradually cool the value.
+        clamped_density, saved_density = _clamp_and_decay(
+            jit_stats.get("max_exit_density") or 0.0,
+            parent_jit_stats.get("max_exit_density") or 0.0,
+        )
+        clamped_delta_density, saved_delta_density = _clamp_and_decay(
+            jit_stats.get("child_delta_max_exit_density") or 0.0,
+            parent_jit_stats.get("child_delta_max_exit_density") or 0.0,
+        )
+        clamped_delta_exits, saved_delta_exits = _clamp_and_decay(
+            jit_stats.get("child_delta_total_exits") or 0,
+            parent_jit_stats.get("child_delta_total_exits") or 0,
+        )
+
+        if clamped_density > 0:
+            print(
+                f"  [~] Tachycardia decay: {clamped_density:.4f} -> {saved_density:.4f}",
+                file=sys.stderr,
+            )
+        if clamped_delta_density > 0:
+            print(
+                f"  [~] Tachycardia delta decay: {clamped_delta_density:.4f} -> "
+                f"{saved_delta_density:.4f}",
+                file=sys.stderr,
+            )
+        if clamped_delta_exits > 0:
+            print(
+                f"  [~] Tachycardia delta exits decay: {clamped_delta_exits:.0f} -> "
+                f"{saved_delta_exits:.0f}",
+                file=sys.stderr,
+            )
+
+        jit_stats_for_save = jit_stats.copy()
+        jit_stats_for_save["max_exit_density"] = saved_density
+        jit_stats_for_save["child_delta_max_exit_density"] = saved_delta_density
+        jit_stats_for_save["child_delta_total_exits"] = saved_delta_exits
+
+        saved_mutation_info: MutationInfo = {**mutation_info, "jit_stats": jit_stats_for_save}
+
+        return NewCoverageResult(
+            status="NEW_COVERAGE",
+            core_code=core_code_to_save,
+            baseline_coverage=child_coverage,
+            content_hash=content_hash,
+            coverage_hash=coverage_hash,
+            execution_time_ms=exec_result.execution_time_ms,
+            parent_id=parent_id,
+            mutation_info=saved_mutation_info,
+            mutation_seed=mutation_seed,
+            jit_avg_time_ms=exec_result.jit_avg_time_ms,
+            nojit_avg_time_ms=exec_result.nojit_avg_time_ms,
+        )
