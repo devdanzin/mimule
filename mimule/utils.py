@@ -2,18 +2,20 @@
 
 Includes utilities for logging, managing run statistics, and structuring data.
 
-Port note: inherited from lafleur/utils.py with two fixes:
-  1. `except FileNotFoundError, json.JSONDecodeError, OSError:` → parenthesized tuple
-     (the lafleur version has this as Py2-style syntax, which is a SyntaxError in
-     Py3; those functions have presumably been dead code in lafleur since the
-     IOError→OSError migration commit that introduced it).
-  2. Same fix for `except ValueError, TypeError:` in parse_timestamp.
-  3. `RunStats` imported at module level rather than TYPE_CHECKING, since we
-     control both files and there's no circular import concern.
+Port note: inherited from lafleur/utils.py with two small deltas:
 
-The CPython-specific FUZZING_ENV dict is replaced with an empty stub — mimule
-will populate it with Monkey-specific env vars (e.g. `JIT_EVENTS=1`) once
-Henry's instrumentation lands.
+  1. `except` clauses use the parenthesized `except (T1, T2, T3):` form
+     rather than lafleur's bare `except T1, T2, T3:`. Both forms are valid
+     on Python 3.14+ thanks to PEP 758, but mimule's pyproject declares
+     `requires-python = ">=3.12"` — the parenthesized form is the only one
+     that's portable across 3.12/3.13/3.14+. Functionally identical.
+  2. `RunStats` is imported at module level rather than under TYPE_CHECKING,
+     since we control both files in mimule's fresh port and there's no
+     circular import concern.
+
+The CPython-specific FUZZING_ENV dict is replaced with the plain inherited
+environment — mimule will populate it with Monkey-specific env vars (e.g.
+`JIT_EVENTS=1`) once Henry's instrumentation lands.
 """
 
 import json

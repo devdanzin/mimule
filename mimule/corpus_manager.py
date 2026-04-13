@@ -14,9 +14,9 @@ classes, responsible for:
 Port note: inherited from lafleur/corpus_manager.py with the following
 adaptations:
 
-  1. SYNTAX FIX — line 210 in lafleur has `except ValueError, IndexError:`
-     (Py2 style, SyntaxError on Py3). Same class of bug as lafleur/utils.py.
-     Fixed here as `except (ValueError, IndexError):`.
+  1. `except` clauses use the parenthesized `except (T1, T2):` form rather
+     than lafleur's PEP 758 bare form, matching mimule's 3.12+ target.
+     Functionally identical on 3.14.
 
   2. CORPUS_DIR path changed from `corpus/jit_interesting_tests/` (lafleur's
      Python test name) to `corpus/monkey_tests/`.
