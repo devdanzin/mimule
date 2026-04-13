@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimule"
+version = "0.0.1"
+description = "A feedback-driven, evolutionary fuzzer for the Monkey language tracing JIT in henry-the-frog/monkey-lang."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-2.0-only"
+license-files = ["LICENSE"]
+authors = [
+  {name = "Daniel Diniz"},
+]
+keywords = ["fuzzer", "monkey", "jit", "evolutionary", "testing"]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = [
+  # Runtime deps go here as we port modules from lafleur. Kept minimal on
+  # purpose — lafleur itself has only `psutil` as its one non-stdlib dep.
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/devdanzin/mimule"
+Repository = "https://github.com/devdanzin/mimule"
+"Related: lafleur" = "https://github.com/devdanzin/lafleur"
+"Related: monkey-lang" = "https://github.com/henry-the-frog/monkey-lang"
+"Related: corpus" = "https://github.com/devdanzin/monkey-lang-tests-corpus"
+
+[project.scripts]
+# Will be populated as we port orchestrator.py
+# mimule = "mimule.orchestrator:main"
+
+[tool.setuptools.packages.find]
+include = ["mimule*"]
+exclude = ["tests*"]
